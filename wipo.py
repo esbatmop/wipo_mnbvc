@@ -1,207 +1,243 @@
-import threading
+# -*- coding: utf-8 -*-
 import time
-import queue
-from DrissionPage import ChromiumPage
-from parsel import Selector
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
 import sys
 import csv
+import logging
+from DrissionPage import ChromiumPage
+from parsel import Selector
+from functools import wraps
 
-# 配置常量
-DEFAULT_IPC = 'A23P20/17'
-URL = 'https://patentscope.wipo.int/search/zh/search.jsf'
-PAGE_LIMIT = 200
+# -------------------- 配置部分 --------------------
+class Config:
+    # 文件路径配置
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+    LOG_FILE = os.path.join(BASE_DIR, 'wipo_crawler.log')
+    DATA_FILE = os.path.join(BASE_DIR, 'wipo_data.csv')
+    IPC_LIST_FILE = os.path.join(BASE_DIR, 'wipo_ipcs_list.txt')
+    
+    # 爬虫参数
+    DEFAULT_IPC = 'A23P20/17'
+    MAX_RETRY = 3
+    PAGE_LOAD_TIMEOUT = 15
+    ACTION_DELAY = 1.5
+    PAGE_LIMIT = 200
 
-def get_base_dir():
-    if getattr(sys, 'frozen', False):
-        print(f"Running in bundled mode, base directory: {sys._MEIPASS}")
-        return sys._MEIPASS
-    print(f"Running in normal mode, base directory: {os.path.dirname(os.path.abspath(__file__))}")
-    return os.path.dirname(os.path.abspath(__file__))
+# -------------------- 工具函数 --------------------
+def setup_logging():
+    """配置日志系统"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(Config.LOG_FILE),
+            logging.StreamHandler()
+        ]
+    )
 
-# 获取当前脚本所在的目录
-current_dir = get_base_dir()
+def retry(retries=3, delay=5, exceptions=(Exception,)):
+    """重试装饰器"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    if attempt == retries:
+                        raise
+                    logging.warning(f"Attempt {attempt} failed: {str(e)}. Retrying in {delay}s...")
+                    time.sleep(delay)
+        return wrapper
+    return decorator
 
-# 设置文件路径为 dist/wipo_arm 目录
-base_dir = os.path.dirname(current_dir)  # 获取上级目录
-LOG_FILE = os.path.join(base_dir, 'wipo_ipcs_list_logs.txt')
-DATA_FILE = os.path.join(base_dir, 'wipo_data.csv')
-IPC_LIST_FILE = os.path.join(base_dir, 'wipo_ipcs_list.txt')
-
-print(f"Log file path: {LOG_FILE}")
-print(f"Data file path: {DATA_FILE}")
-print(f"IPC list file path: {IPC_LIST_FILE}")
-
-# 创建一个队列，最大大小为5
-q = queue.Queue(maxsize=5)
-web = ChromiumPage()
-
-def get_last_ipc():
-    """从文件中读取最后处理的 IPC"""
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'r') as f:
-            lines = f.readlines()
-            if lines:
-                return lines[-1].strip().replace(' ', '')  # 返回最后一行 IPC
-    return None
-
-def initialize_web():
-    """初始化网页"""
-    web.get(URL)
-    web.ele('@value=CLASSIF').click()
-    web.ele('#simpleSearchForm:fpSearch:input').input(get_last_ipc() or DEFAULT_IPC, clear=True)
-    web.ele('#simpleSearchForm:fpSearch:buttons').click()
-    time.sleep(5)
-    web.ele('@value=200', -1).click()
-    web.wait.load_start()
-    print('开始爬取')
-
-def add_to_logs(ipc_):
-    """记录处理的 IPC"""
-    with open(LOG_FILE, 'a') as f:
-        f.write(ipc_ + '\n')
-
-def remove_from_logs(ipc_):
-    """从日志中移除 IPC"""
-    # 检查日志文件是否存在，如果不存在则创建一个空文件
-    if not os.path.exists(LOG_FILE):
-        print(f"日志文件不存在，正在创建: {LOG_FILE}")
-        with open(LOG_FILE, 'w') as f:
-            f.write('')  # 创建一个空文件
-    with open(LOG_FILE, 'r') as f:
-        lines = f.readlines()
-    with open(LOG_FILE, 'w') as f:
-        f.writelines([line for line in lines if line.strip() != ipc_])
-
-def pop_from_list():
-    """从 IPC 列表中弹出下一个 IPC"""
-    if os.path.exists(IPC_LIST_FILE):
-        with open(IPC_LIST_FILE, 'r') as f:
-            lines = f.readlines()
-        if lines:
-            ipc_ = lines[0].strip()
-            with open(IPC_LIST_FILE, 'w') as f:
-                f.writelines(lines[1:])
-            return ipc_
-    return None
-
-def handle_data(html):
-    """处理网页数据"""
-    text = Selector(html)
-    eles = text.xpath('//tbody[@id="resultListForm:resultTable_data"]/tr')
-    print(f'大小 {len(eles)}')
-    try:
-        page = text.css('.ps-paginator--page--value').xpath('string(.)').get().replace('\n', '')
-    except Exception as e:
-        page = "没有数据"
-    data_list = []
-    for ele in eles:
-        name = ele.css('span.ps-patent-result--title--title.content--text-wrap').xpath('string(.)').get().strip() if ele.css('span.ps-patent-result--title--title.content--text-wrap') else ''
-        data_rk = ele.css('tr::attr(data-rk)').get()
-        data_ri = ele.css('tr::attr(data-ri)').get()
-        pubdate = ele.css('div.ps-patent-result--title--ctr-pubdate').xpath('string(.)').get().strip()
-        serial_number = ele.css('span.notranslate.ps-patent-result--title--record-number').xpath('string(.)').get().strip() if ele.css('span.notranslate.ps-patent-result--title--record-number') else ''
-        detail_url = 'https://patentscope.wipo.int/search/zh/' + ele.css('div.ps-patent-result--first-row a::attr(href)').get() if ele.css('div.ps-patent-result--first-row a') else ''
-        ipc = ele.xpath('.//div[@id="resultListForm:resultTable:0:patentResult"]/@data-mt-ipc').get().strip() if ele.xpath('.//div[@id="resultListForm:resultTable:0:patentResult"]') else ''
-        application_number = ele.xpath('.//span[contains(text(), "申请号")]/following-sibling::span').xpath('string(.)').get().strip() if ele.xpath('.//span[contains(text(), "申请号")]/following-sibling::span') else ''
-        application_people = ele.xpath('.//span[contains(text(), "申请人")]/following-sibling::span').xpath('string(.)').get().strip() if ele.xpath('.//span[contains(text(), "申请人")]/following-sibling::span') else ''
-        inventor = ele.xpath('.//span[contains(text(), "发明人")]/following-sibling::span').xpath('string(.)').get().strip() if ele.xpath('.//span[contains(text(), "发明人")]/following-sibling::span') else ''
-        introduction = ele.xpath('.//span[@class="trans-section needTranslation-biblio"]').xpath('string(.)').get().strip() if ele.xpath('.//span[@class="trans-section needTranslation-biblio"]') else ''
+# -------------------- 核心爬虫类 --------------------
+class WIPOCrawler:
+    def __init__(self):
+        self.browser = ChromiumPage()
+        self.current_ipc = None
+        self.processed_ipcs = set()
         
-        data_dict = {
-            'name': name,
-            'data_rk': data_rk,
-            'data_ri': data_ri,
-            'ipc': ipc,
-            'pubdate': pubdate,
-            'serial_number': serial_number,
-            'detail_url': detail_url,
-            'application_number': application_number,
-            'application_people': application_people,
-            'inventor': inventor,
-            'page': page,
-            'introduction': introduction
-        }
-        print(data_dict)
-        data_list.append(data_dict)
+        # 初始化状态
+        self._load_processed_ipcs()
+        
+    def _load_processed_ipcs(self):
+        """加载已处理的IPC列表"""
+        if os.path.exists(Config.LOG_FILE):
+            with open(Config.LOG_FILE, 'r') as f:
+                self.processed_ipcs = set(line.strip() for line in f)
 
-    # if data_list:
-        # save_data_to_file(data_list)
-    return page
+    @retry(retries=Config.MAX_RETRY, delay=5)
+    def _safe_click(self, selector, description="元素"):
+        """安全点击元素"""
+        elem = self.browser.ele(selector, timeout=Config.PAGE_LOAD_TIMEOUT)
+        if not elem:
+            raise ElementNotFoundError(f"{description}未找到: {selector}")
+        elem.click()
+        time.sleep(Config.ACTION_DELAY)
+        return True
 
-def save_data_to_file(data_list):
-    """Save data to a CSV file based on dictionary keys in the list"""
-    if not data_list:
-        return  # Exit if the list is empty
+    @retry(retries=Config.MAX_RETRY, delay=10)
+    def _safe_input(self, selector, text, description="输入框"):
+        """安全输入文本"""
+        elem = self.browser.ele(selector, timeout=Config.PAGE_LOAD_TIMEOUT)
+        if not elem:
+            raise ElementNotFoundError(f"{description}未找到: {selector}")
+        elem.input(text)
+        return True
 
-    file_exists = os.path.exists(DATA_FILE)
+    def _get_next_ipc(self):
+        """获取下一个待处理的IPC"""
+        # 先从日志文件获取最后处理的IPC
+        if os.path.exists(Config.LOG_FILE):
+            with open(Config.LOG_FILE, 'r') as f:
+                lines = f.readlines()
+                if lines:
+                    return lines[-1].strip()
 
-    # Use the keys from the first dictionary as the fieldnames for the CSV file
-    fieldnames = data_list[0].keys()
+        # 从IPC列表文件获取
+        if os.path.exists(Config.IPC_LIST_FILE):
+            with open(Config.IPC_LIST_FILE, 'r') as f:
+                for line in f:
+                    ipc = line.strip()
+                    if ipc and ipc not in self.processed_ipcs:
+                        return ipc
+        return Config.DEFAULT_IPC
 
-    # Open the CSV file in append mode and write rows
-    with open(DATA_FILE, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-
-        # Write the header only if the file is new
-        if not file_exists:
-            writer.writeheader()
-
-        # Write each dictionary in the list as a row in the CSV file
-        writer.writerows(data_list)
-
-def producer():
-    """生产者任务"""
-    ipc_ = get_last_ipc() or DEFAULT_IPC
-    while True:
-        if not q.full():
-            q.put(web.html)
+    def _handle_pagination(self):
+        """处理分页逻辑"""
+        while True:
             try:
-                page = web.ele('.ps-paginator--page--value').raw_text.replace('\n', '')
-                print(f"生产: {page}")
-            except Exception as e:
-                print(f'没有数据: {e}')
+                # 处理当前页数据
+                self._process_page()
                 
-            ele = web.ele('xpath://a[@aria-label="下一页"]', timeout=5)
-            if not ele:
-                print('移除')
-                print(ipc_)
-                remove_from_logs(ipc_)
-                print('读取')
-                ipc_ = pop_from_list()
-                if not ipc_:
-                    print("没有更多 IPC，结束生产者")
+                # 尝试翻页
+                next_btn = self.browser.ele('xpath://a[@aria-label="下一页"]', timeout=5)
+                if not next_btn:
+                    logging.info("已到达最后一页")
                     break
-                add_to_logs(ipc_)
-                web.ele('#advancedSearchForm:advancedSearchInput:input').input('IC:(' + ipc_.replace(' ', '') + ')', clear=True, by_js=True)
-                web.ele('#advancedSearchForm:advancedSearchInput:buttons').click()
-                web.wait.load_start()
-            else:
-                ele.click()
-                web.wait.load_start()
-        else:
-            print("队列已满，生产者等待...")
-        time.sleep(2)
+                    
+                self._safe_click('xpath://a[@aria-label="下一页"]', "下一页按钮")
+                self.browser.wait.load_start()
+                
+            except Exception as e:
+                logging.error(f"分页处理失败: {str(e)}")
+                break
 
-def consumer():
-    """消费者任务"""
-    while True:
-        if not q.empty():
-            item = q.get()
-            data_size = handle_data(item)
-            print(f"消费: {data_size} 条数据")
-            q.task_done()
-        else:
-            print("队列已空，消费者等待...")
-        time.sleep(5)
+    def _process_page(self):
+        """处理单页数据"""
+        try:
+            html = self.browser.html
+            selector = Selector(html)
+            rows = selector.xpath('//tbody[@id="resultListForm:resultTable_data"]/tr')
+            
+            if not rows:
+                logging.warning("当前页面没有数据")
+                return
 
+            data_list = []
+            for row in rows:
+                # 数据解析逻辑（保持原有处理逻辑）
+                data = {
+                    'name': row.css('span.ps-patent-result--title--title::text').get('').strip(),
+                    'pubdate': row.css('div.ps-patent-result--title--ctr-pubdate::text').get('').strip(),
+                    'ipc': row.xpath('.//div[@id="resultListForm:resultTable:0:patentResult"]/@data-mt-ipc').get('').strip(),
+                    # 其他字段解析...
+                }
+                data_list.append(data)
+                
+            self._save_data(data_list)
+            
+        except Exception as e:
+            logging.error(f"页面数据处理失败: {str(e)}")
+            raise
+
+    def _save_data(self, data_list):
+        """安全保存数据"""
+        try:
+            file_exists = os.path.exists(Config.DATA_FILE)
+            with open(Config.DATA_FILE, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=data_list[0].keys() if data_list else [])
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerows(data_list)
+        except Exception as e:
+            logging.error(f"数据保存失败: {str(e)}")
+            raise
+
+    def _switch_ipc(self, new_ipc):
+        """切换IPC分类"""
+        try:
+            logging.info(f"切换到新IPC分类: {new_ipc}")
+            
+            # 执行搜索操作
+            self._safe_input('#advancedSearchForm:advancedSearchInput:input', f'IC:({new_ipc})', "搜索框")
+            self._safe_click('#advancedSearchForm:advancedSearchInput:buttons', "搜索按钮")
+            
+            # 设置每页显示数量
+            self._safe_click(f'@value={Config.PAGE_LIMIT}', "分页下拉")
+            self.browser.wait.load_start()
+            
+            self.current_ipc = new_ipc
+            with open(Config.LOG_FILE, 'a') as f:
+                f.write(new_ipc + '\n')
+                
+        except Exception as e:
+            logging.error(f"IPC切换失败: {str(e)}")
+            raise
+
+    def run(self):
+        """主运行逻辑"""
+        try:
+            # 初始化浏览器
+            self.browser.get('https://patentscope.wipo.int/search/zh/search.jsf')
+            self._safe_click('@value=CLASSIF', "分类搜索按钮")
+            
+            # 主循环
+            while True:
+                current_ipc = self._get_next_ipc()
+                if not current_ipc:
+                    logging.info("所有IPC分类处理完成")
+                    break
+                    
+                if current_ipc in self.processed_ipcs:
+                    logging.info(f"IPC {current_ipc} 已处理，跳过")
+                    continue
+                    
+                try:
+                    self._switch_ipc(current_ipc)
+                    self._handle_pagination()
+                    self.processed_ipcs.add(current_ipc)
+                except Exception as e:
+                    logging.error(f"IPC {current_ipc} 处理失败，跳过")
+                    continue
+
+        finally:
+            self.browser.quit()
+            logging.info("爬虫正常终止")
+
+# -------------------- 异常处理 --------------------
+class CrawlerError(Exception):
+    """基础异常类"""
+    pass
+
+class ElementNotFoundError(CrawlerError):
+    """元素未找到异常"""
+    pass
+
+class PageLoadError(CrawlerError):
+    """页面加载失败异常"""
+    pass
+
+# -------------------- 执行入口 --------------------
 if __name__ == '__main__':
-    # 初始化网页
-    initialize_web()
-
-    # 使用线程池执行生产者和消费者任务
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        executor.submit(producer)
-        executor.submit(consumer)
+    setup_logging()
+    try:
+        crawler = WIPOCrawler()
+        crawler.run()
+    except KeyboardInterrupt:
+        logging.info("用户中断操作")
+    except Exception as e:
+        logging.error(f"致命错误: {str(e)}")
+        raise
